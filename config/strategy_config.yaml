@@ -1,0 +1,69 @@
+strategy:
+  name: "kalman_statarb_pairs"
+  version: "3.0.0"
+
+exit_model:
+  model_path: "models/logistic_exit_model.pkl"
+  scaler_path: "models/feature_scaler.pkl"
+  metadata_path: "models/model_metadata.json"
+  # Single source of truth for live / backtest / research
+  probability_threshold: 0.68
+  # Prefer sklearn StatArbExitManager artifacts; legacy JSON path is deprecated
+  backend: "sklearn"  # sklearn | legacy_json
+
+training:
+  min_samples: 50
+  calibrate_min_samples: 8
+  good_pnl_threshold: 0.35
+  penalty: "l2"
+  C: 1.0
+  class_weight: "balanced"   # none | balanced
+  holdout: "pair"            # random | pair
+
+risk_engine:
+  max_half_life_multiplier: 2.5
+  absolute_min_bars: 5          # floor for time-stop (NOT a cap)
+  stop_loss_z: 4.0
+  hard_pnl_stop_dollars: -150.00
+  # Soft mean-reversion fallback only when sklearn weights are missing
+  soft_mr_long_z: -0.35
+  soft_mr_short_z: 0.35
+
+# Entry/exit signal. research/backtest_pairs.py (real prices 2020-09 → 2026-09,
+# next-open fills, costs) found the Kalman-innovation signal lost money in
+# every period and universe tested (live-like: -$17.4k on $100k). The level
+# signal below was the most consistent configuration across both universes
+# tested, but its edge is small and unstable — judge it on the Alpaca equity
+# log (results/alpaca_equity.csv), not on backtests.
+signal:
+  type: "level"          # level | innovation
+  level_window: 120      # rolling OLS / z window in bars (60 and 250 did worse)
+  exit_z: 0.5            # take profit once |z| reverts inside this band
+
+entry:
+  # Level signal: enter only on large dislocations. Low thresholds mainly
+  # buy more trades and more costs (live-like 1.5 averaged -$12..-18/trade).
+  z_entry: 3.0
+  min_confidence: 0.0    # confidence gate applies to the innovation signal only
+
+# Gates for the path-label harvest that trains the innovation-signal exit
+# model (exit_model above). Independent of the live entry gate.
+harvest:
+  z_entry: 1.5
+  min_confidence: 0.40
+
+execution:
+  broker: "alpaca_paper"  # or alpaca_live
+  order_type: "market"
+  cost_bps: 4.0
+  risk_frac: 0.08
+  capital: 100000.0
+  # Enter only on the freshest bar. Entering on a signal from up to N bars
+  # ago trades after the spread may already have reverted; a 3-day delay
+  # lowered backtest P&L in both universes tested.
+  live_entry_lookback_bars: 1
+
+kalman:
+  delta: 1.0e-4
+  R_base: 1.0e-2
+  noise_model: "standard"  # standard | volume | parkinson

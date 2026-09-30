@@ -1,0 +1,199 @@
+name: Paper Trading CI
+
+on:
+  push:
+    branches: [main, "cursor/**"]
+  pull_request:
+    branches: [main]
+  # Scheduling is external (see cron-job.org), which calls the GitHub API to
+  # dispatch this workflow 6x weekdays across US extended hours.
+  # workflow_dispatch is what it calls into.
+  workflow_dispatch: {}
+
+concurrency:
+  group: paper-trading-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # main-claude keeps its own journal, dataset and models, separate from
+  # main's results-data, so the two strategies never overwrite each other.
+  RESULTS_BRANCH: results-data-claude
+
+jobs:
+  run-paper-trading:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check
+        run: python -m py_compile paper_trading_ml_exit.py alpaca_paper_broker.py
+
+      - name: Unit tests
+        run: |
+          export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
+          python -m unittest discover -s tests -v
+          python -m unittest test_paper_trading_ml_exit.py -v
+
+      - name: Restore accumulated results from the results branch
+        run: |
+          mkdir -p results models
+          git fetch --depth=1 origin "$RESULTS_BRANCH" 2>/dev/null || echo "No $RESULTS_BRANCH branch yet (first run)"
+          if git rev-parse --verify "origin/$RESULTS_BRANCH" >/dev/null 2>&1; then
+            for f in \
+              results/paper_trades.csv \
+              results/exit_training_dataset.csv \
+              results/alpaca_equity.csv \
+              results/model_metadata.json
+            do
+              if git cat-file -e "origin/${RESULTS_BRANCH}:$f" 2>/dev/null; then
+                git show "origin/${RESULTS_BRANCH}:$f" > "$f"
+              fi
+            done
+            # Sklearn weights live under models/ at runtime (gitignored on main).
+            # Persist them on the results branch so live can load ML exits before retrain.
+            for f in logistic_exit_model.pkl feature_scaler.pkl; do
+              if git cat-file -e "origin/${RESULTS_BRANCH}:results/$f" 2>/dev/null; then
+                git show "origin/${RESULTS_BRANCH}:results/$f" > "models/$f"
+                echo "Restored models/$f from $RESULTS_BRANCH"
+              fi
+            done
+            if [ -f results/model_metadata.json ]; then
+              cp -f results/model_metadata.json models/model_metadata.json
+            fi
+            echo "Restored prior results (if present)."
+          fi
+
+      - name: Run paper trading + ML exit trainer
+        env:
+          # Repo → Settings → Secrets and variables → Actions
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+          # Accepted aliases
+          APCA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY }}
+          APCA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ALPACA_API_KEY:-}" ] && [ -n "${ALPACA_API_SECRET_KEY:-}" ]; then
+            echo "🏦 Alpaca secrets present"
+            echo "--- Live Alpaca paper only (journal_scope=alpaca; no sim fills) ---"
+            python paper_trading_ml_exit.py \
+              --mode live \
+              --broker alpaca \
+              --data-source auto \
+              --save-journal alpaca \
+              --min-trades 1
+          else
+            echo "📒 No Alpaca secrets — syntax/unit tests already ran; skipping live session"
+            echo "   Add ALPACA_API_KEY and ALPACA_API_SECRET_KEY under Repo Settings → Secrets"
+          fi
+
+      - name: Harvest training labels (path-label → dataset only)
+        # Live Alpaca only moves one bar/day. Path harvest writes per-bar
+        # lookahead labels (SYSTEM_SPEC §3.1) without touching paper_trades.
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+          APCA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY }}
+          APCA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          echo "--- Path-label harvest → exit_training_dataset.csv ---"
+          python paper_trading_ml_exit.py \
+            --harvest-training \
+            --data-source auto \
+            --n-bars 700
+          echo "--- Harvest verification checklist ---"
+          python scripts/verify_harvest.py --dataset results/exit_training_dataset.csv
+
+      - name: Retrain from stored results
+        # Soft: harvest may still be thin on a bad data day
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python paper_trading_ml_exit.py --train-only
+          # Mirror train artifacts into results/ so the results branch stays the SSOT
+          # for both the dataset and the sklearn weights used by live.
+          mkdir -p results
+          if [ -f models/model_metadata.json ]; then
+            cp -f models/model_metadata.json results/model_metadata.json
+          fi
+          for f in logistic_exit_model.pkl feature_scaler.pkl; do
+            if [ -f "models/$f" ]; then
+              cp -f "models/$f" "results/$f"
+            fi
+          done
+          if [ -f results/model_metadata.json ]; then
+            echo "--- Retrain summary ---"
+            python -c "import json; m=json.load(open('results/model_metadata.json')); met=m.get('metrics') or {}; bal=met.get('class_balance') or {}; print(f\"n_samples={met.get('n_samples')}  pos_rate={bal.get('positive_rate')}  auc={met.get('roc_auc')}  class_weight={m.get('class_weight')}  holdout={m.get('holdout')}\")"
+          fi
+
+      - name: Upload results artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: paper-trading-results
+          path: |
+            results/paper_trades.csv
+            results/exit_training_dataset.csv
+            results/model_metadata.json
+            results/logistic_exit_model.pkl
+            results/feature_scaler.pkl
+            results/logistic_exit_model.json
+          if-no-files-found: warn
+
+      - name: Publish accumulated results to the results branch
+        # Avoid push+pull_request double-publish races on the same SHA.
+        if: always() && github.event_name != 'pull_request'
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Preserve the freshly generated files before switching branches
+          # (results/ is gitignored on this branch, so it must be cleared
+          # before checkout or it collides with the results branch's tracked copy).
+          mkdir -p /tmp/results-out
+          cp -f results/*.csv results/*.json results/*.pkl /tmp/results-out/ 2>/dev/null || true
+          rm -rf results
+
+          for attempt in 1 2 3 4 5; do
+            git fetch --depth=1 origin "$RESULTS_BRANCH" 2>/dev/null || true
+            if git rev-parse --verify "origin/$RESULTS_BRANCH" >/dev/null 2>&1; then
+              git checkout -B "$RESULTS_BRANCH" "origin/$RESULTS_BRANCH"
+            else
+              git checkout --orphan "$RESULTS_BRANCH"
+              git rm -rf . >/dev/null 2>&1 || true
+            fi
+
+            mkdir -p results
+            cp -f /tmp/results-out/* results/ 2>/dev/null || true
+            git add results
+            if git diff --cached --quiet; then
+              echo "No changes to persist."
+              exit 0
+            fi
+            git commit -m "Update accumulated paper-trading results" || true
+            if git push origin "HEAD:$RESULTS_BRANCH"; then
+              echo "Published $RESULTS_BRANCH (attempt ${attempt})"
+              exit 0
+            fi
+            echo "$RESULTS_BRANCH push race (attempt ${attempt}); retrying..."
+            sleep $((attempt * 2))
+          done
+          echo "Failed to publish $RESULTS_BRANCH after retries"
+          exit 1
